@@ -14,6 +14,7 @@ group :development do
 
   gem 'rspec',          '~> 3.0'
   gem 'simplecov',      '~> 0.7', require: false
+  gem 'rubyzip'
 
   gem 'kramdown',       '~> 2.0'
   gem 'redcarpet',       platform: :mri

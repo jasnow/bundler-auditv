@@ -5,7 +5,21 @@ describe Scanner do
   let(:bundle)    { 'unpatched_gems' }
   let(:directory) { File.join('spec','bundle',bundle) }
 
+  # An advisory (by CVE alias) that affects the 'unpatched_gems' bundle
+  # (Active Record 3.2.10: JSON parameter parsing query bypass, fixed in 3.2.11).
+  # The ignore list in spec/bundle/unpatched_gems_with_dot_configuration/
+  # .bundler-audit.yml must contain this same ID, and spec/fixtures/osv must
+  # hold the OSV record that has it as its id or an alias.
+  let(:ignored_id) { 'CVE-2013-0155' }
+
   subject { described_class.new(directory) }
+
+  # All identifiers (id, CVE-, GHSA-, OSVDB-) of the advisories in the results.
+  def identifiers_of(results)
+    results.grep(Results::UnpatchedGem).flat_map { |result|
+      result.advisory.identifiers
+    }
+  end
 
   describe "#initialize" do
     context "when given no arguments" do
@@ -90,7 +104,7 @@ describe Scanner do
 
       it "must load the configuration from the config file" do
         expect(subject.config).to be_kind_of(Configuration)
-        expect(subject.config.ignore).to include('OSVDB-89025')
+        expect(subject.config.ignore).to include(ignored_id)
       end
     end
 
@@ -104,7 +118,7 @@ describe Scanner do
 
         it "must load the configuration from the absolute path" do
           expect(subject.config).to be_kind_of(Configuration)
-          expect(subject.config.ignore).to include('OSVDB-89025')
+          expect(subject.config.ignore).to include(ignored_id)
         end
       end
 
@@ -115,7 +129,7 @@ describe Scanner do
 
         it "must load the configuration from the relative path" do
           expect(subject.config).to be_kind_of(Configuration)
-          expect(subject.config.ignore).to include('OSVDB-89025')
+          expect(subject.config.ignore).to include(ignored_id)
         end
       end
     end
@@ -158,15 +172,44 @@ describe Scanner do
             result.advisory.vulnerable?(result.gem.version)
           }).to be_truthy
         end
+
+        it "should find the advisory used by the ignore specs" do
+          expect(identifiers_of(subject)).to include(ignored_id)
+        end
       end
 
       context "when the :ignore option is given" do
-        subject { super().scan(ignore: ['CVE-2013-0156']) }
+        subject { super().scan(ignore: [ignored_id]) }
 
         it "should ignore the specified advisories" do
-          ids = subject.map { |result| result.advisory.id }
+          expect(identifiers_of(subject)).not_to include(ignored_id)
+        end
 
-          expect(ids).not_to include('CVE-2013-0156')
+        it "should still report other advisories" do
+          expect(subject.to_a).not_to be_empty
+        end
+      end
+
+      context "when ignoring by a different identifier of the same advisory" do
+        let(:advisory) do
+          described_class.new(directory).scan.to_a.grep(Results::UnpatchedGem).map(&:advisory).find { |advisory|
+            advisory.identifiers.include?(ignored_id)
+          }
+        end
+
+        it "should ignore the advisory by its GHSA id" do
+          ghsa_id = advisory.ghsa_id
+          skip "fixture advisory has no GHSA identifier" unless ghsa_id
+
+          results = described_class.new(directory).scan(ignore: [ghsa_id])
+
+          expect(identifiers_of(results)).not_to include(ignored_id)
+        end
+
+        it "should ignore the advisory by its primary id" do
+          results = described_class.new(directory).scan(ignore: [advisory.id])
+
+          expect(identifiers_of(results)).not_to include(ignored_id)
         end
       end
     end
@@ -199,10 +242,15 @@ describe Scanner do
 
       subject { scanner.scan }
 
-      it "should ignore the specified advisories" do
-        ids = subject.map { |result| result.advisory.id }
+      it "should report the advisory when nothing is ignored" do
+        # Control: an explicit empty :ignore list bypasses the config file.
+        results = scanner.scan(ignore: [])
 
-        expect(ids).not_to include('OSVDB-89025')
+        expect(identifiers_of(results)).to include(ignored_id)
+      end
+
+      it "should ignore the specified advisories" do
+        expect(identifiers_of(subject)).not_to include(ignored_id)
       end
 
       context "when config path is absolute" do
@@ -211,9 +259,7 @@ describe Scanner do
         let(:scanner) { described_class.new(directory,'Gemfile.lock',Database.new,absolute_config_path) }
 
         it "should read the config just fine" do
-          ids = subject.map { |result| result.advisory.id }
-
-          expect(ids).not_to include('OSVDB-89025')
+          expect(identifiers_of(subject)).not_to include(ignored_id)
         end
       end
 
@@ -223,9 +269,7 @@ describe Scanner do
         let(:scanner) { described_class.new(directory,'Gemfile.lock',Database.new,relative_config_path) }
 
         it "should read the config just fine" do
-          ids = subject.map { |result| result.advisory.id }
-
-          expect(ids).not_to include('OSVDB-89025')
+          expect(identifiers_of(subject)).not_to include(ignored_id)
         end
       end
     end

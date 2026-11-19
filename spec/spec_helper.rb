@@ -5,6 +5,8 @@ SimpleCov.start do
 end
 
 require 'rspec'
+require 'fileutils'
+require 'zip'
 require 'bundler/audit/database'
 
 module Fixtures
@@ -13,18 +15,49 @@ module Fixtures
   TMP_DIR = File.expand_path('../tmp',__FILE__)
 
   module Database
+    # Source records: OSV JSON files, one per advisory, in the same flat
+    # format as OSV's RubyGems/all.zip dump. Add records here (see the
+    # note below) for every gem and advisory the specs expect to find.
+    OSV_PATH = File.join(ROOT,'osv')
+
+    # Generated database, in the layout Bundler::Audit::Database reads
+    # (<PATH>/gems/<gem name>/<advisory id>.json). Safe to delete or gitignore.
     PATH = File.join(ROOT,'database')
 
-    COMMIT = '89cdde9a725bb6f8a483bca97c5da344e060ac61'
+    #
+    # Zips the records in {OSV_PATH}, like OSV's all.zip dump.
+    #
+    # @return [String]
+    #
+    def self.zip_data
+      files = Dir.glob(File.join(OSV_PATH,'*.json')).sort
 
-    def self.clone
-      system 'git', 'clone', '--quiet', Bundler::Audit::Database::URL, PATH
+      if files.empty?
+        raise("no OSV fixture records found in #{OSV_PATH}")
+      end
+
+      buffer = Zip::OutputStream.write_buffer do |zip|
+        files.each do |file|
+          zip.put_next_entry(File.basename(file))
+          zip.write(File.read(file))
+        end
+      end
+
+      buffer.string
     end
 
-    def self.reset!(commit=COMMIT)
-      Dir.chdir(PATH) do
-        system 'git', 'reset', '--hard', commit
-      end
+    #
+    # (Re)builds {PATH} offline from {OSV_PATH}, using the real installer.
+    #
+    def self.build!
+      FileUtils.mkdir_p(PATH)
+
+      Bundler::Audit::Database.install(zip_data,PATH)
+    end
+
+    # Specs that used to reset the git checkout now just rebuild it.
+    def self.reset!(*)
+      build!
     end
   end
 
@@ -55,11 +88,7 @@ RSpec.configure do |config|
   include Helpers
 
   config.before(:suite) do
-    unless File.directory?(Fixtures::Database::PATH)
-      Fixtures::Database.clone
-    end
-
-    Fixtures::Database.reset!
+    Fixtures::Database.build!
 
     FileUtils.mkdir_p(Fixtures::TMP_DIR)
   end

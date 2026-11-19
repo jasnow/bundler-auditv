@@ -88,22 +88,18 @@ module Bundler
         exit(1) if report.vulnerable?
       end
 
-      desc 'stats', 'Prints ruby-advisory-db stats'
+      desc 'stats', 'Prints OSV RubyGems advisory database stats'
       method_option :quiet, type: :boolean, aliases: '-q'
 
       def stats(path=Database::DEFAULT_PATH)
         database = Database.new(path)
 
-        puts "ruby-advisory-db:"
+        puts "OSV RubyGems advisories:"
         puts "  advisories:\t#{database.size} advisories"
         puts "  last updated:\t#{database.last_updated_at}"
-
-        if (commit_id = database.commit_id)
-          puts "  commit:\t#{commit_id}"
-        end
       end
 
-      desc 'download', 'Downloads ruby-advisory-db'
+      desc 'download', 'Downloads the OSV RubyGems advisory database'
       method_option :quiet, type: :boolean, aliases: '-q'
 
       def download(path=Database::DEFAULT_PATH)
@@ -112,7 +108,7 @@ module Bundler
           return
         end
 
-        say("Download ruby-advisory-db ...") unless options.quiet?
+        say("Downloading OSV RubyGems advisories ...") unless options.quiet?
 
         begin
           Database.download(path: path, quiet: options.quiet?)
@@ -124,7 +120,7 @@ module Bundler
         stats(path) unless options.quiet?
       end
 
-      desc 'update', 'Updates the ruby-advisory-db'
+      desc 'update', 'Updates the OSV RubyGems advisory database'
       method_option :quiet, type: :boolean, aliases: '-q'
 
       def update(path=Database::DEFAULT_PATH)
@@ -133,24 +129,14 @@ module Bundler
           return
         end
 
-        say("Updating ruby-advisory-db ...") unless options.quiet?
+        say("Updating OSV RubyGems advisories ...") unless options.quiet?
 
         database = Database.new(path)
 
         begin
-          case database.update!(quiet: options.quiet?)
-          when true
-            say("Updated ruby-advisory-db", :green) unless options.quiet?
-          when nil
-            if Bundler.git_present?
-              unless options.quiet?
-                say "Skipping update, ruby-advisory-db is not a git repository", :yellow
-              end
-            else
-              say_error "Git is not installed!", :red
-              exit 1
-            end
-          end
+          database.update!(quiet: options.quiet?)
+
+          say("Updated OSV RubyGems advisories", :green) unless options.quiet?
         rescue Database::UpdateFailed => error
           say error.message, :red
           exit 1

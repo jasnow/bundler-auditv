@@ -2,59 +2,60 @@ require 'spec_helper'
 require 'bundler/audit/database'
 require 'bundler/audit/advisory'
 
+require 'date'
+require 'json'
+require 'tmpdir'
+
 describe Bundler::Audit::Advisory do
   let(:root) { Fixtures::DATABASE_PATH }
   let(:gem)  { 'test' }
   let(:id)   { 'CVE-2020-1234' }
-  let(:path) { Fixtures.join('advisory',"#{id}.yml") }
+  let(:path) { Fixtures.join('advisory',"#{id}.json") }
 
   subject { described_class.load(path) }
 
-  let(:a_patched_version) do
-    subject.patched_versions.map { |version_rule|
-      # For all the rules, get the individual constraints out and see if we
-      # can find a suitable one...
-      version_rule.requirements.select { |(constraint, gem_version)|
-        # We only want constraints where the version number specified is
-        # one of the unaffected version.  I.E. we don't want ">", "<", or if
-        # such a thing exists, "!=" constraints.
-        ['~>', '>=', '=', '<='].include?(constraint)
-      }.map { |(constraint, gem_version)|
-        # Fetch just the version component, which is a Gem::Version,
-        # and extract the string representation of the version.
-        gem_version.version
-      }
-    }.flatten.first
+  # Fixture ranges: affected 0.1.0...1.0.0 and 2.0.0...2.1.0, so
+  #   unaffected_versions: ["< 0.1.0"]
+  #   patched_versions:    [">= 1.0.0, < 2.0.0", ">= 2.1.0"]
+  let(:a_patched_version)     { '1.0.0' }
+  let(:an_unaffected_version) { '0.0.9' }
+
+  # Loads an advisory from an in-memory OSV record.
+  def load_record(record)
+    Dir.mktmpdir do |dir|
+      file = File.join(dir,"#{record['id'] || 'record'}.json")
+      File.write(file,JSON.generate(record))
+
+      described_class.load(file)
+    end
   end
 
-  let(:an_unaffected_version) do
-    subject.unaffected_versions.map { |version_rule|
-      # For all the rules, get the individual constraints out and see if we
-      # can find a suitable one...
-      version_rule.requirements.select { |(constraint, gem_version)|
-        # We only want constraints where the version number specified is
-        # one of the unaffected version.  I.E. we don't want ">", "<", or if
-        # such a thing exists, "!=" constraints.
-        ['~>', '>=', '=', '<='].include?(constraint)
-      }.map { |(constraint, gem_version)|
-        # Fetch just the version component, which is a Gem::Version,
-        # and extract the string representation of the version.
-        gem_version.version
-      }
-    }.flatten.first
+  # Builds an advisory from OSV `affected` entries.
+  def advisory_for(affected)
+    unaffected, patched = described_class.parse_affected(affected)
+
+    described_class.new.tap do |advisory|
+      advisory.unaffected_versions = unaffected
+      advisory.patched_versions    = patched
+    end
+  end
+
+  def affected_with(ranges=[],versions=nil)
+    entry = {
+      'package' => {'ecosystem' => 'RubyGems', 'name' => 'test'},
+      'ranges'  => ranges.map { |events| {'type' => 'ECOSYSTEM', 'events' => events} }
+    }
+    entry['versions'] = versions if versions
+
+    [entry]
+  end
+
+  def constraints(requirements)
+    requirements.map { |req| req.requirements.map { |op,ver| "#{op} #{ver}" }.sort }
   end
 
   describe "load" do
-    let(:data) do
-      File.open(path) do |yaml|
-        if Psych::VERSION >= '3.1.0'
-          YAML.safe_load(yaml, permitted_classes: [Date])
-        else
-          # XXX: psych < 3.1.0 YAML.safe_load calling convention
-          YAML.safe_load(yaml, [Date])
-        end
-      end
-    end
+    let(:data) { JSON.parse(File.read(path)) }
 
     describe '#id' do
       subject { super().id }
@@ -63,48 +64,91 @@ describe Bundler::Audit::Advisory do
 
     describe '#url' do
       subject { super().url }
-      it { is_expected.to eq(data['url'])         }
+      it { is_expected.to eq('https://github.com/advisories/GHSA-xfhh-rx56-rxcr') }
     end
 
     describe '#title' do
       subject { super().title }
-      it { is_expected.to eq(data['title'])       }
+      it { is_expected.to eq(data['summary'])     }
     end
 
     describe '#date' do
       subject { super().date }
-      it { is_expected.to eq(data['date'])        }
+      it { is_expected.to eq(Date.parse(data['published'])) }
     end
 
     describe '#cvss_v2' do
       subject { super().cvss_v2 }
-      it { is_expected.to eq(data['cvss_v2'])     }
+      it { is_expected.to be_nil }
     end
 
     describe '#cvss_v3' do
       subject { super().cvss_v3 }
-      it { is_expected.to eq(data['cvss_v3'])     }
+      it { is_expected.to be_nil }
     end
 
     describe '#cvss_v4' do
       subject { super().cvss_v4 }
-      it { is_expected.to eq(data['cvss_v4'])     }
+      it { is_expected.to be_nil }
     end
 
     describe '#description' do
       subject { super().description }
-      it { is_expected.to eq(data['description']) }
+      it { is_expected.to eq(data['details'])     }
     end
 
-    context "YAML data not representing a hash" do
+    describe '#cve' do
+      subject { super().cve }
+      it { is_expected.to eq('2020-1234') }
+    end
+
+    describe '#ghsa' do
+      subject { super().ghsa }
+      it { is_expected.to eq('xfhh-rx56-rxcr') }
+    end
+
+    describe '#identifiers' do
+      subject { super().identifiers }
+      it { is_expected.to eq(['CVE-2020-1234', 'GHSA-xfhh-rx56-rxcr']) }
+    end
+
+    context "JSON data not representing a hash" do
       let(:path) do
-        File.expand_path('../fixtures/advisory/not_a_hash.yml', __FILE__)
+        File.expand_path('../fixtures/advisory/not_a_hash.json', __FILE__)
       end
 
       it "should raise an exception" do
         expect {
           Advisory.load(path)
         }.to raise_exception("advisory data in #{path.dump} was not a Hash")
+      end
+    end
+
+    context "when the record has no references" do
+      subject do
+        load_record('id' => 'GHSA-aaaa-bbbb-cccc', 'summary' => 'A summary')
+      end
+
+      it "should link to osv.dev" do
+        expect(subject.url).to eq('https://osv.dev/vulnerability/GHSA-aaaa-bbbb-cccc')
+      end
+
+      it "should extract the GHSA id from the record id" do
+        expect(subject.ghsa).to eq('aaaa-bbbb-cccc')
+        expect(subject.cve).to be_nil
+      end
+
+      it "should fall back to the summary for the description" do
+        expect(subject.description).to eq('A summary')
+      end
+    end
+
+    context "when the record has no summary or details" do
+      subject { load_record('id' => 'GHSA-aaaa-bbbb-cccc') }
+
+      it "should use the id as the title and never leave a nil description" do
+        expect(subject.title).to eq('GHSA-aaaa-bbbb-cccc')
+        expect(subject.description).to eq('')
       end
     end
 
@@ -118,7 +162,154 @@ describe Bundler::Audit::Advisory do
       end
 
       it "should parse the versions" do
-        expect(subject.map(&:to_s)).to eq(data['patched_versions'])
+        expect(constraints(subject)).to eq([
+          ['< 2.0.0', '>= 1.0.0'],
+          ['>= 2.1.0']
+        ])
+      end
+    end
+
+    describe "#unaffected_versions" do
+      subject { described_class.load(path).unaffected_versions }
+
+      it "should parse the versions" do
+        expect(constraints(subject)).to eq([['< 0.1.0']])
+      end
+    end
+  end
+
+  describe ".parse_affected" do
+    context "with several maintained branches" do
+      subject do
+        advisory_for(affected_with([[
+          {'introduced' => '0'},     {'fixed' => '2.3.18'},
+          {'introduced' => '3.0.0'}, {'fixed' => '3.1.12'},
+          {'introduced' => '3.2.0'}, {'fixed' => '3.2.13'}
+        ]]))
+      end
+
+      %w[2.3.17 3.0.0 3.1.11 3.2.0 3.2.12].each do |version|
+        it "should consider #{version} vulnerable" do
+          expect(subject.vulnerable?(Gem::Version.new(version))).to be true
+        end
+      end
+
+      %w[2.3.18 3.1.12 3.1.99 3.2.13 4.0.0].each do |version|
+        it "should consider #{version} patched" do
+          expect(subject.vulnerable?(Gem::Version.new(version))).to be false
+        end
+      end
+    end
+
+    context "with last_affected" do
+      subject do
+        advisory_for(affected_with([[
+          {'introduced' => '1.0.0'}, {'last_affected' => '1.5.0'}
+        ]]))
+      end
+
+      it "should treat last_affected as inclusive" do
+        expect(subject.vulnerable?(Gem::Version.new('1.0.0'))).to be true
+        expect(subject.vulnerable?(Gem::Version.new('1.5.0'))).to be true
+      end
+
+      it "should treat versions outside the range as safe" do
+        expect(subject.vulnerable?(Gem::Version.new('0.9.9'))).to be false
+        expect(subject.vulnerable?(Gem::Version.new('1.5.1'))).to be false
+      end
+    end
+
+    context "with an open-ended range (no fix)" do
+      subject { advisory_for(affected_with([[{'introduced' => '2.0.0'}]])) }
+
+      it "should have no patched versions" do
+        expect(subject.patched_versions).to be_empty
+      end
+
+      it "should be vulnerable from the introduced version onward" do
+        expect(subject.vulnerable?(Gem::Version.new('1.9.9'))).to be false
+        expect(subject.vulnerable?(Gem::Version.new('2.0.0'))).to be true
+        expect(subject.vulnerable?(Gem::Version.new('99.0.0'))).to be true
+      end
+    end
+
+    context "with overlapping ranges" do
+      subject do
+        advisory_for(affected_with([
+          [{'introduced' => '0'},     {'fixed' => '2.0.0'}],
+          [{'introduced' => '1.0.0'}, {'fixed' => '3.0.0'}]
+        ]))
+      end
+
+      it "should merge them" do
+        expect(subject.vulnerable?(Gem::Version.new('2.5.0'))).to be true
+        expect(subject.vulnerable?(Gem::Version.new('3.0.0'))).to be false
+        expect(constraints(subject.patched_versions)).to eq([['>= 3.0.0']])
+      end
+    end
+
+    context "with touching ranges" do
+      subject do
+        advisory_for(affected_with([
+          [{'introduced' => '0'},     {'fixed' => '1.0.0'}],
+          [{'introduced' => '1.0.0'}, {'fixed' => '2.0.0'}]
+        ]))
+      end
+
+      it "should leave no gap between them" do
+        expect(subject.vulnerable?(Gem::Version.new('1.0.0'))).to be true
+        expect(constraints(subject.patched_versions)).to eq([['>= 2.0.0']])
+      end
+    end
+
+    context "with only an explicit versions list" do
+      subject { advisory_for(affected_with([],['1.2.3'])) }
+
+      it "should only flag the listed version" do
+        expect(subject.vulnerable?(Gem::Version.new('1.2.3'))).to be true
+        expect(subject.vulnerable?(Gem::Version.new('1.2.2'))).to be false
+        expect(subject.vulnerable?(Gem::Version.new('1.2.4'))).to be false
+      end
+    end
+
+    context "when a listed version is also inside a range" do
+      subject do
+        advisory_for(affected_with(
+          [[{'introduced' => '0'}, {'fixed' => '2.0.0'}]],
+          ['1.0.0', '1.5.0']
+        ))
+      end
+
+      it "should not create gaps or duplicate patched versions" do
+        expect(constraints(subject.patched_versions)).to eq([['>= 2.0.0']])
+        expect(subject.unaffected_versions).to be_empty
+      end
+    end
+
+    context "when nothing can be parsed" do
+      it "should fail closed when there are no ranges" do
+        advisory = advisory_for(affected_with([]))
+
+        expect(advisory.patched_versions).to be_empty
+        expect(advisory.unaffected_versions).to be_empty
+        expect(advisory.vulnerable?(Gem::Version.new('1.0.0'))).to be true
+      end
+
+      it "should ignore non-ECOSYSTEM ranges" do
+        affected = [{
+          'package' => {'ecosystem' => 'RubyGems', 'name' => 'test'},
+          'ranges'  => [{'type' => 'GIT', 'events' => [{'introduced' => '0'}, {'fixed' => 'abc123'}]}]
+        }]
+
+        expect(advisory_for(affected).vulnerable?(Gem::Version.new('1.0.0'))).to be true
+      end
+
+      it "should leave the range open when the fixed version is malformed" do
+        advisory = advisory_for(affected_with([[
+          {'introduced' => '1.0.0'}, {'fixed' => 'not a version!'}
+        ]]))
+
+        expect(advisory.vulnerable?(Gem::Version.new('5.0.0'))).to be true
       end
     end
   end
@@ -211,6 +402,18 @@ describe Bundler::Audit::Advisory do
         advisory.ghsa = "2020-3456"
       end
       expect(advisory.identifiers).to eq(["GHSA-2020-3456"])
+    end
+
+    it "should include the primary id without duplicating it" do
+      advisory = described_class.new.tap do |advisory|
+        advisory.id  = "GHSA-2020-3456"
+        advisory.ghsa = "2020-3456"
+      end
+
+      expect(advisory.identifiers).to eq(["GHSA-2020-3456"])
+
+      advisory.id = "OSV-2020-1"
+      expect(advisory.identifiers).to eq(["OSV-2020-1", "GHSA-2020-3456"])
     end
   end
 
@@ -344,6 +547,38 @@ describe Bundler::Audit::Advisory do
 
       it { expect(subject.criticality).to eq(:critical) }
     end
+
+    context "when there is no numeric CVSS score" do
+      it "should fall back to the OSV severity label" do
+        {
+          'LOW'      => :low,
+          'MODERATE' => :medium,
+          'MEDIUM'   => :medium,
+          'HIGH'     => :high,
+          'CRITICAL' => :critical
+        }.each do |label,criticality|
+          advisory = load_record(
+            'id' => 'GHSA-aaaa-bbbb-cccc',
+            'database_specific' => {'severity' => label}
+          )
+
+          expect(advisory.criticality).to eq(criticality)
+        end
+      end
+
+      it "should be nil when the record has no severity" do
+        expect(load_record('id' => 'GHSA-aaaa-bbbb-cccc').criticality).to be_nil
+      end
+
+      it "should prefer a numeric score over the label" do
+        advisory = described_class.new.tap do |advisory|
+          advisory.cvss_v3  = 2.0
+          advisory.severity = :critical
+        end
+
+        expect(advisory.criticality).to eq(:low)
+      end
+    end
   end
 
   describe "#unaffected?" do
@@ -414,6 +649,14 @@ describe Bundler::Audit::Advisory do
             expect(subject.vulnerable?(version)).to be_truthy
           end
         end
+      end
+    end
+
+    context "when passed a version in a second affected range" do
+      let(:version) { Gem::Version.new('2.0.5') }
+
+      it "should return true" do
+        expect(subject.vulnerable?(version)).to be_truthy
       end
     end
   end

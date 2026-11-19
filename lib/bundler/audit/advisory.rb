@@ -1,230 +1,131 @@
+# lib/bundler/audit/advisory.rb  (DRAFT: loads OSV JSON instead of ruby-advisory-db YAML)
 #
-# Copyright (c) 2013-2026 Hal Brodigan (postmodern.mod3 at gmail.com)
-#
-# bundler-audit is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# bundler-audit is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with bundler-audit.  If not, see <https://www.gnu.org/licenses/>.
-#
+# Keep the existing public readers (id, url, title, description, cve, ghsa,
+# criticality, patched_versions, unaffected_versions, ...) so the CLI/JSON
+# output code is untouched. The real change is vulnerable?: OSV describes
+# affected ranges (introduced/fixed/last_affected), not "patched/unaffected"
+# requirement lists, so we evaluate the ranges directly.
 
-require 'date'
-require 'yaml'
+require 'json'
+require 'rubygems'
 
 module Bundler
   module Audit
-    #
-    # Represents an advisory loaded from the {Database}.
-    #
-    class Advisory < Struct.new(:path,
-                                :id,
-                                :url,
-                                :title,
-                                :date,
-                                :description,
-                                :cvss_v2,
-                                :cvss_v3,
-                                :cvss_v4,
-                                :cve,
-                                :osvdb,
-                                :ghsa,
-                                :unaffected_versions,
-                                :patched_versions)
+    class Advisory
 
-      #
-      # Loads the advisory from a YAML file.
-      #
-      # @param [String] path
-      #   The path to the advisory YAML file.
-      #
-      # @return [Advisory]
-      #
-      # @api semipublic
-      #
+      attr_reader :path, :id, :aliases, :url, :title, :description,
+                  :cve, :ghsa, :criticality, :cvss_v3,
+                  :patched_versions, :unaffected_versions
+
       def self.load(path)
-        id   = File.basename(path).chomp('.yml')
-        data = File.open(path) do |yaml|
-                 if Psych::VERSION >= '3.1.0'
-                   YAML.safe_load(yaml, permitted_classes: [Date])
-                 else
-                   # XXX: psych < 3.1.0 YAML.safe_load calling convention
-                   YAML.safe_load(yaml, [Date])
-                 end
-               end
-
-        unless data.kind_of?(Hash)
-          raise("advisory data in #{path.dump} was not a Hash")
-        end
-
-        parse_versions = lambda { |versions|
-          Array(versions).map do |version|
-            Gem::Requirement.new(*version.split(', '))
-          end
-        }
-
-        return new(
-          path,
-          id,
-          data['url'],
-          data['title'],
-          data['date'],
-          data['description'],
-          data['cvss_v2'],
-          data['cvss_v3'],
-          data['cvss_v4'],
-          data['cve'],
-          data['osvdb'],
-          data['ghsa'],
-          parse_versions[data['unaffected_versions']],
-          parse_versions[data['patched_versions']]
-        )
+        record = JSON.parse(File.read(path))
+        new(path, record)
       end
 
-      #
-      # The CVE identifier.
-      #
-      # @return [String, nil]
-      #
-      def cve_id
-        "CVE-#{cve}" if cve
-      end
+      def initialize(path, record)
+        @path        = path
+        @id          = record['id']
+        @aliases     = Array(record['aliases'])
+        @title       = record['summary']
+        @description = record['details']
+        @url         = pick_url(record)
+        @cve         = (all_ids.find { |i| i.start_with?('CVE-') } || '').sub(/\ACVE-/, '') # old API returned id without prefix
+        @cve         = nil if @cve.empty?
+        @ghsa        = all_ids.find { |i| i.start_with?('GHSA-') }
+        @cvss_v3     = Array(record['severity']).find { |s| s['type'] == 'CVSS_V3' }&.fetch('score', nil)
+        @criticality = map_severity(record.dig('database_specific', 'severity'))
 
-      #
-      # The OSVDB identifier.
-      #
-      # @return [String, nil]
-      #
-      def osvdb_id
-        "OSVDB-#{osvdb}" if osvdb
-      end
+        @intervals = []
+        @versions  = []
+        Array(record['affected']).each do |affected|
+          pkg = affected['package'] || {}
+          next unless pkg['ecosystem'] == 'RubyGems'
 
-      #
-      # The GHSA (GitHub Security Advisory) identifier
-      #
-      # @return [String, nil]
-      #
-      # @since 0.7.0
-      #
-      def ghsa_id
-        "GHSA-#{ghsa}" if ghsa
-      end
-
-      #
-      # Return a compacted list of all ids
-      #
-      # @return [Array<String>]
-      #
-      # @since 0.7.0
-      #
-      def identifiers
-        [
-          cve_id,
-          osvdb_id,
-          ghsa_id
-        ].compact
-      end
-
-      #
-      # Determines how critical the vulnerability is.
-      #
-      # @return [:none, :low, :medium, :high, :critical, nil]
-      #   The criticality of the vulnerability based on the CVSS score.
-      #
-      def criticality
-        if cvss_v4 || cvss_v3
-          case cvss_v4 || cvss_v3
-          when 0.0       then :none
-          when 0.1..3.9  then :low
-          when 4.0..6.9  then :medium
-          when 7.0..8.9  then :high
-          when 9.0..10.0 then :critical
-          end
-        elsif cvss_v2
-          case cvss_v2
-          when 0.0..3.9  then :low
-          when 4.0..6.9  then :medium
-          when 7.0..10.0 then :high
+          @versions.concat(Array(affected['versions']))
+          Array(affected['ranges']).each do |range|
+            @intervals.concat(intervals_for(range['events'])) if range['type'] == 'ECOSYSTEM'
           end
         end
+
+        # Display only (the "Solution: update to ..." line); matching uses @intervals.
+        @patched_versions = @intervals.map { |(_, upper, kind)|
+          Gem::Requirement.new(">= #{upper}") if kind == :exclusive
+        }.compact.uniq
+        @unaffected_versions = []
       end
 
-      #
-      # Checks whether the version is not affected by the advisory.
-      #
-      # @param [Gem::Version] version
-      #   The version to compare against {#unaffected_versions}.
-      #
-      # @return [Boolean]
-      #   Specifies whether the version is not affected by the advisory.
-      #
-      # @since 0.2.0
-      #
-      def unaffected?(version)
-        unaffected_versions.any? do |unaffected_version|
-          unaffected_version === version
-        end
+      # Also matches OSV aliases, so `--ignore CVE-...` and `--ignore GHSA-...`
+      # both work no matter which ID is the record's primary one.
+      def ids
+        all_ids
       end
 
-      #
-      # Checks whether the version is patched against the advisory.
-      #
-      # @param [Gem::Version] version
-      #   The version to compare against {#patched_versions}.
-      #
-      # @return [Boolean]
-      #   Specifies whether the version is patched against the advisory.
-      #
-      # @since 0.2.0
-      #
-      def patched?(version)
-        patched_versions.any? do |patched_version|
-          patched_version === version
-        end
-      end
-
-      #
-      # Checks whether the version is vulnerable to the advisory.
-      #
-      # @param [Gem::Version] version
-      #   The version to compare against {#patched_versions}.
-      #
-      # @return [Boolean]
-      #   Specifies whether the version is vulnerable to the advisory or not.
-      #
       def vulnerable?(version)
-        !patched?(version) && !unaffected?(version)
+        version = Gem::Version.new(version.to_s)
+
+        return true if @versions.any? { |v| safe_version(v) == version }
+
+        @intervals.any? do |(lower, upper, kind)|
+          (lower.nil? || version >= lower) &&
+            (upper.nil? || (kind == :inclusive ? version <= upper : version < upper))
+        end
       end
 
-      #
-      # Compares two advisories.
-      #
-      # @param [Advisory] other
-      #
-      # @return [Boolean]
-      #
-      def ==(other)
-        id == other.id
+      def to_s
+        @id
       end
 
-      #
-      # Converts the advisory to a Hash.
-      #
-      # @return [Hash{Symbol => Object}]
-      #
-      def to_h
-        super.merge({
-          criticality: criticality
-        })
+      private
+
+      def all_ids
+        [@id, *@aliases].compact
       end
 
-      alias to_s id
+      def safe_version(str)
+        Gem::Version.new(str)
+      rescue ArgumentError
+        nil
+      end
+
+      # OSV events -> [[lower, upper, :exclusive|:inclusive|nil], ...]
+      # "introduced: 0" means no lower bound; no fixed/last_affected means open-ended.
+      def intervals_for(events)
+        intervals = []
+        open  = false
+        lower = nil
+
+        Array(events).each do |event|
+          if event.key?('introduced')
+            open  = true
+            lower = event['introduced'] == '0' ? nil : safe_version(event['introduced'])
+          elsif event.key?('fixed')
+            intervals << [lower, safe_version(event['fixed']), :exclusive]
+            open = false
+          elsif event.key?('last_affected')
+            intervals << [lower, safe_version(event['last_affected']), :inclusive]
+            open = false
+          end
+        end
+
+        intervals << [lower, nil, nil] if open
+        intervals
+      end
+
+      def pick_url(record)
+        refs = Array(record['references'])
+        (refs.find { |r| r['type'] == 'ADVISORY' } || refs.first || {})['url']
+      end
+
+      # GHSA uses LOW/MODERATE/HIGH/CRITICAL; the old output used :medium.
+      def map_severity(value)
+        case value.to_s.downcase
+        when 'low'      then :low
+        when 'moderate',
+             'medium'   then :medium
+        when 'high'     then :high
+        when 'critical' then :critical
+        end
+      end
 
     end
   end

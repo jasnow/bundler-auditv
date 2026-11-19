@@ -1,64 +1,37 @@
+# lib/bundler/audit/database.rb  (DRAFT: swaps ruby-advisory-db/git for the OSV RubyGems dump)
 #
-# Copyright (c) 2013-2026 Hal Brodigan (postmodern.mod3 at gmail.com)
-#
-# bundler-audit is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# bundler-audit is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with bundler-audit.  If not, see <https://www.gnu.org/licenses/>.
-#
+# Design: keep the on-disk layout the rest of the code already expects
+# (<path>/gems/<gem name>/<advisory>.<ext>), so each_advisory_path_for,
+# advisories_for, check_gem, size, etc. need no changes beyond the file glob.
+# update! downloads the OSV RubyGems dump and re-indexes it by gem name.
 
 require 'bundler/audit/advisory'
 
+require 'fileutils'
+require 'json'
+require 'net/http'
 require 'time'
-require 'yaml'
+require 'uri'
+require 'zip' # rubyzip: replaces the old `git` requirement
 
 module Bundler
   module Audit
-    #
-    # Represents the directory of advisories, grouped by gem name
-    # and CVE number.
-    #
     class Database
 
-      class DownloadFailed < RuntimeError
-      end
+      # OSV bulk dump of every RubyGems advisory (replaces the git URL).
+      URL = 'https://osv-vulnerabilities.storage.googleapis.com/RubyGems/all.zip'
 
-      class UpdateFailed < RuntimeError
-      end
+      USER_PATH = File.expand_path(File.join(Gem.user_home,'.local','share','osv-rubygems'))
 
-      # Git URL of the ruby-advisory-db.
-      URL = 'https://github.com/rubysec/ruby-advisory-db.git'
-
-      # Path to the user's copy of the ruby-advisory-db.
-      USER_PATH = File.expand_path(File.join(Gem.user_home,'.local','share','ruby-advisory-db'))
-
-      # Default path to the ruby-advisory-db.
-      #
-      # @since 0.8.0
       DEFAULT_PATH = ENV.fetch('BUNDLER_AUDIT_DB',USER_PATH)
 
-      # The path to the advisory database.
-      #
-      # @return [String]
+      class DownloadFailed < RuntimeError; end
+      class UpdateFailed   < RuntimeError; end
+
+      SAFE_NAME = /\A[A-Za-z0-9._\-]+\z/.freeze
+
       attr_reader :path
 
-      #
-      # Initializes the Advisory Database.
-      #
-      # @param [String] path
-      #   The path to the advisory database.
-      #
-      # @raise [ArgumentError]
-      #   The path was not a directory.
-      #
       def initialize(path=self.class.path)
         unless File.directory?(path)
           raise(ArgumentError,"#{path.dump} is not a directory")
@@ -67,317 +40,162 @@ module Bundler
         @path = path
       end
 
-      #
-      # The default path for the database.
-      #
-      # @return [String]
-      #   The path to the database directory.
-      #
       def self.path
         DEFAULT_PATH
       end
 
-      #
-      # Tests whether the database exists.
-      #
-      # @param [String] path
-      #   The given path of the database to check.
-      #
-      # @return [Boolean]
-      #
-      # @since 0.8.0
-      #
       def self.exists?(path=DEFAULT_PATH)
-        File.directory?(path) && !(Dir.entries(path) - %w[. ..]).empty?
+        File.directory?(File.join(path,'gems'))
       end
 
-      #
-      # Downloads the ruby-advisory-db.
-      #
-      # @param [Hash] options
-      #   Additional options.
-      #
-      # @option options [String] :path (DEFAULT_PATH)
-      #   The destination path for the new ruby-advisory-db.
-      #
-      # @option options [Boolean] :quiet
-      #   Specify whether `git` should be `--quiet`.
-      #
-      # @return [Database]
-      #   The newly downloaded database.
-      #
-      # @raise [DownloadFailed]
-      #   Indicates that the download failed.
-      #
-      # @note
-      #   Requires network access.
-      #
-      # @since 0.8.0
-      #
       def self.download(options={})
         unless (options.keys - [:path, :quiet]).empty?
           raise(ArgumentError,"Invalid option(s)")
         end
 
         path = options.fetch(:path,DEFAULT_PATH)
+        FileUtils.mkdir_p(path)
 
-        command = %w[git clone]
-        command << '--quiet' if options[:quiet]
-        command << URL << path
-
-        unless system(*command)
-          raise(DownloadFailed,"failed to download #{URL} to #{path.inspect}")
+        begin
+          install(fetch_zip(URI(URL)),path)
+        rescue SocketError, SystemCallError, Zip::Error, JSON::ParserError => e
+          raise(DownloadFailed,"failed to download #{URL}: #{e.message}")
         end
 
-        return new(path)
+        new(path)
       end
 
-      #
-      # Updates the ruby-advisory-db.
-      #
-      # @param [Hash] options
-      #   Additional options.
-      #
-      # @option options [Boolean] :quiet
-      #   Specify whether `git` should be `--quiet`.
-      #
-      # @return [Boolean]
-      #   Specifies whether the update was successful.
-      #
-      # @raise [ArgumentError]
-      #   Invalid options were given.
-      #
-      # @note
-      #   Requires network access.
-      #
-      # @since 0.3.0
-      #
-      # @deprecated Use {#update!} instead.
-      #
       def self.update!(options={})
-        raise "Invalid option(s)" unless (options.keys - [:quiet]).empty?
+        raise("Invalid option(s)") unless (options.keys - [:quiet]).empty?
 
-        if File.directory?(DEFAULT_PATH)
+        if exists?(DEFAULT_PATH)
           begin
             new(DEFAULT_PATH).update!(options)
-          rescue UpdateFailed then false
+          rescue UpdateFailed
+            false
           end
         else
           begin
-            download(options.merge(path: DEFAULT_PATH))
-          rescue DownloadFailed then false
+            download(options)
+            true
+          rescue DownloadFailed
+            false
           end
         end
       end
 
-      #
-      # Determines if the database is a git repository.
-      #
-      # @return [Boolean]
-      #
-      # @since 0.8.0
-      #
-      def git?
-        File.directory?(File.join(@path,'.git'))
-      end
-
-      #
-      # Updates the ruby-advisory-db.
-      #
-      # @param [Hash] options
-      #   Additional options.
-      #
-      # @option options [Boolean] :quiet
-      #   Specify whether `git` should be `--quiet`.
-      #
-      # @return [true, nil]
-      #   * `true` - the ruby-advisory-db git repository was successfully
-      #     updated.
-      #   * `nil` - the ruby-advisory-db is not a git repository or the `git`
-      #     command is not installed.
-      #
-      # @raise [UpdateFailed]
-      #   Could not update the ruby-advisory-db git repository.
-      #
-      # @since 0.8.0
-      #
       def update!(options={})
-        if git?
-          Dir.chdir(@path) do
-            command = %w[git pull]
-            command << '--quiet' if options[:quiet]
-            command << 'origin' << 'master'
-
-            unless system(*command)
-              raise(UpdateFailed,"failed to update #{@path.inspect}")
-            end
-
-            return true
-          end
-        end
+        self.class.download(options.merge(path: @path))
+        true
+      rescue DownloadFailed => e
+        raise(UpdateFailed,e.message)
       end
 
-      #
-      # The last commit ID of the repository.
-      #
-      # @return [String, nil]
-      #   The commit hash or `nil` if the database is not a git repository.
-      #
-      # @since 0.9.0
-      #
-      def commit_id
-        if git?
-          Dir.chdir(@path) do
-            `git rev-parse HEAD`.chomp
-          end
-        end
-      end
-
-      #
-      # Determines the time when the database was last updated.
-      #
-      # @return [Time]
-      #
-      # @since 0.8.0
-      #
       def last_updated_at
-        if git?
-          Dir.chdir(@path) do
-            Time.parse(`git log --date=iso8601 --pretty="%cd" -1`)
-          end
-        else
-          File.mtime(@path)
-        end
+        File.mtime(@path)
       end
 
-      #
-      # Enumerates over every advisory in the database.
-      #
-      # @yield [advisory]
-      #   If a block is given, it will be passed each advisory.
-      #
-      # @yieldparam [Advisory] advisory
-      #   An advisory from the database.
-      #
-      # @return [Enumerator]
-      #   If no block is given, an Enumerator will be returned.
-      #
+      # The old git commit id has no equivalent for a zip dump.
+      def commit_id
+        nil
+      end
+
       def advisories(&block)
         return enum_for(__method__) unless block_given?
 
-        each_advisory_path do |path|
-          yield Advisory.load(path)
-        end
+        each_advisory_path { |path| yield Advisory.load(path) }
       end
 
-      #
-      # Enumerates over advisories for the given gem.
-      #
-      # @param [String] name
-      #   The gem name to lookup.
-      #
-      # @yield [advisory]
-      #   If a block is given, each advisory for the given gem will be yielded.
-      #
-      # @yieldparam [Advisory] advisory
-      #   An advisory for the given gem.
-      #
-      # @return [Enumerator]
-      #   If no block is given, an Enumerator will be returned.
-      #
       def advisories_for(name)
         return enum_for(__method__,name) unless block_given?
 
-        each_advisory_path_for(name) do |path|
-          yield Advisory.load(path)
-        end
+        each_advisory_path_for(name) { |path| yield Advisory.load(path) }
       end
 
-      #
-      # Verifies whether the gem is effected by any advisories.
-      #
-      # @param [Gem::Specification] gem
-      #   The gem to verify.
-      #
-      # @yield [advisory]
-      #   If a block is given, it will be passed advisories that effect
-      #   the gem.
-      #
-      # @yieldparam [Advisory] advisory
-      #   An advisory that effects the specific version of the gem.
-      #
-      # @return [Enumerator]
-      #   If no block is given, an Enumerator will be returned.
-      #
       def check_gem(gem)
         return enum_for(__method__,gem) unless block_given?
 
         advisories_for(gem.name) do |advisory|
-          if advisory.vulnerable?(gem.version)
-            yield advisory
-          end
+          yield advisory if advisory.vulnerable?(gem.version)
         end
       end
 
-      #
-      # The number of advisories within the database.
-      #
-      # @return [Integer]
-      #   The number of advisories.
-      #
       def size
         each_advisory_path.count
       end
 
-      #
-      # Converts the database to a String.
-      #
-      # @return [String]
-      #   The path to the database.
-      #
       def to_s
         @path
       end
 
-      #
-      # Inspects the database.
-      #
-      # @return [String]
-      #   The inspected database.
-      #
       def inspect
         "#<#{self.class}:#{self}>"
       end
 
       protected
 
-      #
-      # Enumerates over every advisory path in the database.
-      #
-      # @yield [path]
-      #   The given block will be passed each advisory path.
-      #
-      # @yieldparam [String] path
-      #   A path to an advisory `.yml` file.
-      #
       def each_advisory_path(&block)
-        Dir.glob(File.join(@path,'gems','*','*.yml'),&block)
+        return enum_for(__method__) unless block_given?
+
+        Dir.glob(File.join(@path,'gems','*','*.json'),&block)
       end
 
-      #
-      # Enumerates over the advisories for the given gem.
-      #
-      # @param [String] name
-      #   The gem of the gem.
-      #
-      # @yield [path]
-      #   The given block will be passed each advisory path.
-      #
-      # @yieldparam [String] path
-      #   A path to an advisory `.yml` file.
-      #
       def each_advisory_path_for(name,&block)
-        Dir.glob(File.join(@path,'gems',name,'*.yml'),&block)
+        return enum_for(__method__,name) unless block_given?
+        return unless name =~ SAFE_NAME
+
+        Dir.glob(File.join(@path,'gems',name,'*.json'),&block)
+      end
+
+      private
+
+      def self.fetch_zip(uri,limit=5)
+        raise(DownloadFailed,'too many redirects') if limit == 0
+
+        response = Net::HTTP.get_response(uri)
+
+        case response
+        when Net::HTTPSuccess     then response.body
+        when Net::HTTPRedirection then fetch_zip(URI(response['location']),limit - 1)
+        else raise(DownloadFailed,"#{response.code} #{response.message}")
+        end
+      end
+
+      # Unpacks the dump into a temp dir, then swaps it in, so a failed
+      # update never leaves a half-written database behind.
+      def self.install(zip_data,path)
+        staging = File.join(path,"gems.new.#{Process.pid}")
+        FileUtils.rm_rf(staging)
+
+        Zip::File.open_buffer(zip_data) do |zip|
+          zip.each do |entry|
+            next unless entry.name.end_with?('.json')
+
+            record = JSON.parse(entry.get_input_stream.read)
+            next if record['withdrawn']
+            next unless record['id'].to_s =~ SAFE_NAME
+
+            names = Array(record['affected']).map { |a|
+              pkg = a['package'] || {}
+              pkg['name'] if pkg['ecosystem'] == 'RubyGems'
+            }.compact.uniq
+
+            names.each do |name|
+              next unless name =~ SAFE_NAME # never trust names for paths
+
+              dir = File.join(staging,name)
+              FileUtils.mkdir_p(dir)
+              File.write(File.join(dir,"#{record['id']}.json"),JSON.generate(record))
+            end
+          end
+        end
+
+        final = File.join(path,'gems')
+        FileUtils.rm_rf(final)
+        FileUtils.mv(staging,final)
+        FileUtils.touch(path)
+      ensure
+        FileUtils.rm_rf(staging) if staging
       end
 
     end
